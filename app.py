@@ -156,11 +156,20 @@ tab1, tab2, tab3 = st.tabs(["Payout reconciliation", "Breakdown", "Disbursement 
 with tab1:
     st.subheader("Overview")
     a,b,c = st.columns(3)
-    crypto_matched = len(crypto_res.matched) if crypto_res is not None else 0
-    rise_matched = len(rise_res.matched) if rise_res is not None else 0
+    # IMPORTANT: These headline counts should align with the Breakdown tab,
+    # which is "Matched + Late Sync" and is bucketed by backend time.
+    if crypto_res is not None:
+        crypto_matched = len(pd.concat([crypto_res.matched, crypto_res.late_sync], ignore_index=True))
+    else:
+        crypto_matched = 0
+
+    if rise_res is not None:
+        rise_matched = len(pd.concat([rise_res.matched, rise_res.late_sync], ignore_index=True))
+    else:
+        rise_matched = 0
     true_missing = (len(crypto_res.missing_true) if crypto_res is not None else 0) + (len(rise_res.missing_true) if rise_res is not None else 0)
-    a.metric("Crypto matched", crypto_matched)
-    b.metric("Rise matched", rise_matched)
+    a.metric("Crypto matched + late sync", crypto_matched)
+    b.metric("Rise matched + late sync", rise_matched)
     c.metric("True missing (all)", true_missing)
 
     st.subheader("Missing transaction details")
