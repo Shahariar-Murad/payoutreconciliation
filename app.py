@@ -141,14 +141,41 @@ if run_rise:
 tab1, tab2, tab3 = st.tabs(["Payout reconciliation", "Breakdown", "Disbursement totals"])
 
 with tab1:
+    # Wallet payouts that exist in Crypto wallet report but not in backend (Tracking ID present)
+    wallet_payout_not_in_backend = None
+    wallet_payout_not_in_backend_count = 0
+    wallet_payout_not_in_backend_sum = 0.0
+    if run_crypto and crypto_df is not None and len(crypto_df) > 0 and backend_crypto is not None and len(backend_crypto) > 0:
+        try:
+            # wallet payout rows are identified by having a non-empty Tracking ID
+            w = crypto_df.copy()
+            tracking_col = _resolve_col(w, 'Tracking ID', ['tracking_id','trackingId','tracking id','TrackingID'])
+            w = w[w[tracking_col].astype(str).str.strip().ne('')].copy()
+            # Backend transaction id column
+            b = backend_crypto.copy()
+            backend_txn_col = _resolve_col(b, 'Transaction ID', ['TransactionId','transaction_id','transactionId','Txn ID','TxnID','txn_id'])
+            # Normalize to string
+            w['_track_norm'] = w[tracking_col].astype(str).str.strip()
+            b['_txn_norm'] = b[backend_txn_col].astype(str).str.strip()
+            w_missing = w[~w['_track_norm'].isin(set(b['_txn_norm']))].copy()
+            amt_col = _resolve_col(w_missing, CRYPTO_AMT_COL, [CRYPTO_AMT_COL, 'Amount', 'amount', 'Final Amount', 'final_amount'])
+            wallet_payout_not_in_backend = w_missing
+            wallet_payout_not_in_backend_count = int(len(w_missing))
+            wallet_payout_not_in_backend_sum = float(np.nansum(np.abs(pd.to_numeric(w_missing[amt_col], errors='coerce'))))
+        except Exception:
+            wallet_payout_not_in_backend = None
+            wallet_payout_not_in_backend_count = 0
+            wallet_payout_not_in_backend_sum = 0.0
+
     st.subheader("Overview")
-    a,b,c = st.columns(3)
+    cols = st.columns(4)
     crypto_matched = len(crypto_res.matched) if crypto_res is not None else 0
     rise_matched = len(rise_res.matched) if rise_res is not None else 0
     true_missing = (len(crypto_res.missing_true) if crypto_res is not None else 0) + (len(rise_res.missing_true) if rise_res is not None else 0)
-    a.metric("Crypto matched", crypto_matched)
-    b.metric("Rise matched", rise_matched)
-    c.metric("True missing (all)", true_missing)
+    cols[0].metric("Crypto matched", crypto_matched)
+    cols[1].metric("Wallet payout not in backend", wallet_payout_not_in_backend_count, delta=f"${wallet_payout_not_in_backend_sum:,.2f}")
+    cols[2].metric("Rise matched", rise_matched)
+    cols[3].metric("True missing (all)", true_missing)
 
     st.subheader("Missing transaction details")
     with st.expander("Show missing details", expanded=False):
@@ -546,4 +573,3 @@ with st.expander("Show wallet payout not found in backend", expanded=False):
         )
     except Exception as e:
         st.error(f"Could not build wallet→backend mismatch table: {e}")
-
