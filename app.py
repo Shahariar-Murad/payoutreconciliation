@@ -29,9 +29,22 @@ with st.sidebar:
     crypto_file = st.file_uploader("Crypto wallet report CSV", type=["csv"])
     rise_file = st.file_uploader("Rise report CSV", type=["csv"])
 
-    st.header("Report date range (GMT+6)")
-    dr = st.date_input("Select start and end date", value=(date.today() - timedelta(days=1), date.today()))
-    report_tz = st.text_input("Report timezone", value="Asia/Dhaka")
+    # Report timezone controls *all* filtering + display (date range, quick windows, charts/tables).
+    # Provide common options + a custom override.
+    tz_choices = {
+        "UTC+6 (Asia/Dhaka)": "Asia/Dhaka",
+        "UTC+2 (Etc/GMT-2)": "Etc/GMT-2",  # NOTE: Etc/GMT-2 == UTC+2 (POSIX sign is reversed)
+        "UTC (UTC)": "UTC",
+        "Custom…": None,
+    }
+    tz_label = st.selectbox("Report timezone", list(tz_choices.keys()), index=0)
+    report_tz = tz_choices[tz_label] or st.text_input("Custom report timezone (IANA)", value="Asia/Dhaka")
+
+    st.header(f"Report date range ({report_tz})")
+    dr = st.date_input(
+        "Select start and end date",
+        value=(date.today() - timedelta(days=1), date.today()),
+    )
 
     # Team-friendly presets: often they reconcile from previous day evening to today morning,
     # then review 3-hour slots within the same day.
