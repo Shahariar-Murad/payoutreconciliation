@@ -145,7 +145,8 @@ with tab1:
     wallet_payout_not_in_backend = None
     wallet_payout_not_in_backend_count = 0
     wallet_payout_not_in_backend_sum = 0.0
-    if run_crypto and crypto_df is not None and len(crypto_df) > 0 and backend_crypto is not None and len(backend_crypto) > 0:
+    # Use the uploader variable directly to avoid NameError edge-cases during Streamlit reruns.
+    if (crypto_file is not None) and crypto_df is not None and len(crypto_df) > 0 and backend_crypto is not None and len(backend_crypto) > 0:
         try:
             # wallet payout rows are identified by having a non-empty Tracking ID
             w = crypto_df.copy()
