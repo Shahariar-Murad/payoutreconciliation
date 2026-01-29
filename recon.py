@@ -98,6 +98,9 @@ def reconcile_exact(
     w["amount_wallet"] = _safe_float(w[wallet_amount_col]).abs()
 
     b_win = b[(b["ts_report_backend"] >= report_start) & (b["ts_report_backend"] < report_end)].copy()
+    # Add a stable row id so if the wallet report contains duplicate Tracking IDs
+    # (same txn_id repeated), the join does not duplicate backend rows.
+    b_win["__row_id"] = np.arange(len(b_win), dtype=np.int64)
 
     merged = b_win.merge(
         w[["txn_id","ts_report_wallet","amount_wallet"]],
@@ -108,12 +111,28 @@ def reconcile_exact(
     merged["delay_min"] = (merged["ts_report_backend"] - merged["ts_report_wallet"]).dt.total_seconds() / 60
     merged["amount_diff"] = merged["amount_backend"] - merged["amount_wallet"]
 
+    # De-duplicate join explosions: if wallet has multiple rows with the same
+    # Tracking ID, keep the wallet row that is closest in time (and then closest
+    # in amount) for each backend payout row.
+    if merged["__row_id"].duplicated().any():
+        merged = (
+            merged.assign(
+                _abs_delay=merged["delay_min"].abs(),
+                _abs_amt=merged["amount_diff"].abs(),
+            )
+            .sort_values(["__row_id", "_abs_delay", "_abs_amt"], na_position="last")
+            .drop_duplicates(subset=["__row_id"], keep="first")
+            .drop(columns=["_abs_delay", "_abs_amt"])
+            .reset_index(drop=True)
+        )
+
     matched = merged[(merged["ts_report_wallet"].notna()) & (merged["delay_min"].abs() <= tolerance_minutes)].copy()
     late_sync = merged[(merged["ts_report_wallet"].notna()) & (merged["delay_min"].abs() > tolerance_minutes)].copy()
     missing_true = merged[merged["ts_report_wallet"].isna()].copy()
 
     for df in (matched, late_sync, missing_true):
         df["bucket_3h"] = bucket_3h(df["ts_report_backend"])
+        df.drop(columns=["__row_id"], errors="ignore", inplace=True)
 
     summary_3h = _build_summary(matched, late_sync, missing_true, report_start, report_end, report_tz)
     return ReconResult(matched, late_sync, missing_true, summary_3h)
