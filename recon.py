@@ -5,6 +5,8 @@ import pandas as pd
 import re
 import numpy as np
 
+# NOTE: Keep dependencies minimal for Streamlit Cloud.
+
 def _to_utc(series: pd.Series, source_tz: str) -> pd.Series:
     s = pd.to_datetime(series, errors="coerce", utc=False)
     if getattr(s.dt, "tz", None) is not None:
@@ -26,6 +28,134 @@ def plan_category(plan: pd.Series) -> pd.Series:
 
 def is_automation(internal_status: pd.Series) -> pd.Series:
     return internal_status.astype(str).str.lower().str.contains("automation", na=False)
+
+
+def _extract_rise_email_from_desc(desc: pd.Series) -> pd.Series:
+    """Extract email from Rise Description between 'paid to' and 'rise id'.
+
+    We rely on the current Rise report format used in the app.
+    """
+    d = desc.astype(str)
+    # Example pattern: "Paid to someone@example.com ... Rise ID: 123"
+    return d.str.extract(r"paid\s*to\s*([\w.+'-]+@[\w.-]+)\s+rise\s*id", flags=re.IGNORECASE)[0]
+
+
+def find_rise_wallet_payout_not_in_backend(
+    backend_df: pd.DataFrame,
+    rise_df: pd.DataFrame,
+    *,
+    backend_ts_col: str,
+    backend_tz: str,
+    backend_email_col: str,
+    backend_amount_col: str,
+    rise_ts_col: str,
+    rise_tz: str,
+    rise_amount_col: str,
+    rise_desc_col: str,
+    report_start: pd.Timestamp,
+    report_end: pd.Timestamp,
+    report_tz: str,
+    tolerance_minutes: int = 15,
+    amount_tolerance_usd: float = 0.10,
+) -> pd.DataFrame:
+    """Find Rise wallet payout-like rows that do not exist in backend.
+
+    Payout-like = Rise rows where we can extract an email from the Description.
+    Matching rule = same email + abs(amount diff) <= amount_tolerance_usd
+    AND abs(time diff) <= tolerance_minutes, one-to-one (no reuse of backend rows).
+
+    Returned dataframe is in report_tz and filtered to the selected report window.
+    """
+    if backend_df is None or rise_df is None or len(backend_df) == 0 or len(rise_df) == 0:
+        return pd.DataFrame()
+
+    # --- Backend prep (in report_tz window)
+    b = backend_df.copy()
+    b_ts = _to_utc(b[backend_ts_col], backend_tz).dt.tz_convert(report_tz)
+    b_email = b[backend_email_col].astype(str).str.strip().str.lower()
+    b_amt = pd.to_numeric(b[backend_amount_col], errors="coerce")
+
+    b_win = b[(b_ts >= report_start) & (b_ts < report_end)].copy()
+    if len(b_win) == 0:
+        return rise_df.iloc[0:0].copy()
+    b_win["_ts_report"] = b_ts.loc[b_win.index]
+    b_win["_email"] = b_email.loc[b_win.index]
+    b_win["_amt"] = b_amt.loc[b_win.index]
+    b_win = b_win.dropna(subset=["_ts_report", "_email", "_amt"])
+
+    # --- Rise prep (in report_tz window)
+    r = rise_df.copy()
+    r_ts = _to_utc(r[rise_ts_col], rise_tz).dt.tz_convert(report_tz)
+    r_amt = pd.to_numeric(r[rise_amount_col], errors="coerce")
+    r_email = _extract_rise_email_from_desc(r[rise_desc_col]).astype(str).str.strip().str.lower()
+
+    r_rep = r[(r_ts >= report_start) & (r_ts < report_end)].copy()
+    if len(r_rep) == 0:
+        return r.iloc[0:0].copy()
+    r_rep["_ts_report"] = r_ts.loc[r_rep.index]
+    r_rep["_email"] = r_email.loc[r_rep.index]
+    r_rep["_amt"] = r_amt.loc[r_rep.index]
+    r_rep = r_rep.dropna(subset=["_ts_report", "_email", "_amt"])
+    r_rep = r_rep[r_rep["_email"].str.contains("@", na=False)]
+    if len(r_rep) == 0:
+        return r.iloc[0:0].copy()
+
+    # Work in cents to avoid float issues
+    tol_cents = int(round(amount_tolerance_usd * 100))
+    b_win["_cents"] = (b_win["_amt"].round(2) * 100).round().astype("Int64")
+    r_rep["_cents"] = (r_rep["_amt"].round(2) * 100).round().astype("Int64")
+    b_win = b_win.dropna(subset=["_cents"]).copy()
+    r_rep = r_rep.dropna(subset=["_cents"]).copy()
+
+    # Index backend by email for quick candidate lookups
+    b_by_email = {}
+    for idx, row in b_win.iterrows():
+        b_by_email.setdefault(row["_email"], []).append((idx, int(row["_cents"]), row["_ts_report"]))
+    for k in b_by_email:
+        b_by_email[k].sort(key=lambda x: x[2])
+
+    used_backend = set()
+    missing_rows = []
+
+    r_sorted = r_rep.sort_values("_ts_report")
+    for r_idx, rrow in r_sorted.iterrows():
+        email = rrow["_email"]
+        if email not in b_by_email:
+            missing_rows.append(r_idx)
+            continue
+
+        target_cents = int(rrow["_cents"])
+        target_ts = rrow["_ts_report"]
+        best = None
+        best_key = None
+
+        for b_idx, b_cents, b_tsrep in b_by_email[email]:
+            if b_idx in used_backend:
+                continue
+            if abs(b_cents - target_cents) > tol_cents:
+                continue
+            dt_min = abs((b_tsrep - target_ts).total_seconds()) / 60.0
+            if dt_min > float(tolerance_minutes):
+                continue
+            score = (abs(b_cents - target_cents), dt_min)
+            if best is None or score < best:
+                best = score
+                best_key = b_idx
+
+        if best_key is None:
+            missing_rows.append(r_idx)
+        else:
+            used_backend.add(best_key)
+
+    out = r_rep.loc[missing_rows].copy()
+    if len(out) == 0:
+        return out
+
+    # Add friendly columns for display
+    out["Report Time"] = out["_ts_report"].dt.strftime("%Y-%m-%d %I:%M %p")
+    out["Rise Email"] = out["_email"]
+    out["Wallet Amount"] = out["_amt"].round(2)
+    return out
 
 @dataclass
 class ReconResult:
@@ -280,3 +410,136 @@ def reconcile_rise_substring(
 
     summary_3h = _build_summary(matched, late_sync, missing_true, report_start, report_end, report_tz)
     return ReconResult(matched, late_sync, missing_true, summary_3h)
+
+
+def rise_wallet_payout_not_in_backend(
+    backend_df: pd.DataFrame,
+    rise_df: pd.DataFrame,
+    *,
+    backend_ts_col: str,
+    backend_tz: str,
+    backend_email_col: str,
+    rise_ts_col: str,
+    rise_tz: str,
+    rise_desc_col: str,
+    rise_amt_col: str,
+    report_start: pd.Timestamp,
+    report_end: pd.Timestamp,
+    report_tz: str,
+    tolerance_minutes: int = 15,
+    amount_tolerance_usd: float = 0.10,
+) -> pd.DataFrame:
+    """Find Rise wallet *payout-like* transactions (have an extracted email) that don't match any backend payout.
+
+    Matching rules (one-to-one, greedy):
+    - Same email (backend "Payment method Email" vs extracted email from Rise description)
+    - Amount within `amount_tolerance_usd` (compared in cents)
+    - Timestamp within `tolerance_minutes` in the selected report timezone
+
+    Returned dataframe is filtered to the selected report window (Rise timestamp in report_tz).
+    """
+
+    if backend_df is None or rise_df is None or len(backend_df) == 0 or len(rise_df) == 0:
+        return pd.DataFrame()
+
+    b = backend_df.copy()
+    r = rise_df.copy()
+
+    # Prepare backend
+    b["ts_backend_utc"] = _to_utc(b[backend_ts_col], backend_tz)
+    b["ts_report_backend"] = b["ts_backend_utc"].dt.tz_convert(report_tz)
+    b["_email"] = b[backend_email_col].astype(str).str.strip().str.lower()
+
+    # Prepare rise
+    r["ts_wallet_utc"] = _to_utc(r[rise_ts_col], rise_tz)
+    r["ts_report_wallet"] = r["ts_wallet_utc"].dt.tz_convert(report_tz)
+    r["_email"] = _extract_rise_email_from_desc(r[rise_desc_col])
+
+    # Filter to selected report window *by backend date logic*: we show wallet rows that fall in the report window.
+    b_win = b[(b["ts_report_backend"] >= report_start) & (b["ts_report_backend"] < report_end)].copy()
+    r_win = r[(r["ts_report_wallet"] >= report_start) & (r["ts_report_wallet"] < report_end)].copy()
+
+    # Keep only payout-like Rise rows (email found)
+    r_win = r_win[r_win["_email"].notna() & (r_win["_email"].astype(str).str.len() > 0)].copy()
+    if len(b_win) == 0 or len(r_win) == 0:
+        return pd.DataFrame()
+
+    # Amounts in cents
+    b_win["_amt_cents"] = (pd.to_numeric(b_win[backend_amt_col], errors="coerce").fillna(0.0) * 100).round().astype("int64")
+    r_win["_amt_cents"] = (pd.to_numeric(r_win[rise_amt_col], errors="coerce").fillna(0.0) * 100).round().astype("int64")
+
+    tol_cents = int(round(amount_tolerance_usd * 100))
+
+    # Index backend candidates by email
+    b_by_email = {}
+    for idx, row in b_win.iterrows():
+        em = row.get("_email")
+        if not em:
+            continue
+        b_by_email.setdefault(em, []).append(idx)
+
+    used_backend = set()
+    missing_rows = []
+
+    # Greedy matching: sort wallet rows by time
+    r_win = r_win.sort_values("ts_report_wallet")
+
+    for ridx, rrow in r_win.iterrows():
+        em = rrow.get("_email")
+        if not em:
+            continue
+
+        candidates = [i for i in b_by_email.get(em, []) if i not in used_backend]
+        if not candidates:
+            missing_rows.append(ridx)
+            continue
+
+        r_amt = int(rrow.get("_amt_cents", 0))
+        r_ts = rrow.get("ts_report_wallet")
+
+        best = None
+        best_score = None
+
+        for bidx in candidates:
+            b_amt = int(b_win.at[bidx, "_amt_cents"])
+            if abs(b_amt - r_amt) > tol_cents:
+                continue
+            b_ts = b_win.at[bidx, "ts_report_backend"]
+            dt_min = abs((b_ts - r_ts).total_seconds()) / 60.0
+            if dt_min > tolerance_minutes:
+                continue
+
+            # Score: amount diff then time diff
+            score = (abs(b_amt - r_amt), dt_min)
+            if best_score is None or score < best_score:
+                best = bidx
+                best_score = score
+
+        if best is None:
+            missing_rows.append(ridx)
+        else:
+            used_backend.add(best)
+
+    out = r_win.loc[missing_rows].copy() if missing_rows else pd.DataFrame()
+    if len(out) == 0:
+        return out
+
+    # Friendly columns
+    out.rename(
+        columns={
+            rise_ts_col: "wallet_timestamp",
+            rise_amt_col: "wallet_amount",
+            rise_desc_col: "wallet_description",
+        },
+        inplace=True,
+    )
+    out["wallet_email"] = out["_email"]
+    out["report_time"] = out["ts_report_wallet"].dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    keep = [
+        "report_time",
+        "wallet_email",
+        "wallet_amount",
+        "wallet_description",
+    ]
+    return out[[c for c in keep if c in out.columns]].reset_index(drop=True)
